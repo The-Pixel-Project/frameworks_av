@@ -23,6 +23,8 @@
 #endif
 //#define LOG_NDEBUG 0
 
+#include <android-base/properties.h>
+#include <android-base/strings.h>
 #include <camera/CameraUtils.h>
 #include <camera/StringUtils.h>
 #include <camera/camera2/CaptureRequest.h>
@@ -97,9 +99,17 @@ CameraDeviceClient::CameraDeviceClient(
       mStreamingRequestId(REQUEST_ID_NONE),
       mStreamingRequestLastFrameNumber(NO_IN_FLIGHT_REPEATING_FRAMES),
       mRequestIdCounter(0),
+      mPrivilegedClient(false),
       mOverrideForPerfClass(overrideForPerfClass),
       mOriginalCameraId(originalCameraId),
       mIsVendorClient(isVendorClient) {
+
+      std::vector<std::string> privilegedClientList = android::base::Split(
+              android::base::GetProperty("persist.vendor.camera.privapp.list", ""), ",");
+      auto it = std::find(privilegedClientList.begin(), privilegedClientList.end(),
+              clientPackageName);
+      mPrivilegedClient = it != privilegedClientList.end();
+
     ATRACE_CALL();
     ALOGI("CameraDeviceClient %s: Opened", cameraId.c_str());
 }
@@ -209,6 +219,7 @@ status_t CameraDeviceClient::initializeImpl(TProviderPtr providerPtr,
             strerror(-res), res);
         return res;
     }
+    mDevice->setPrivilegedClient(mPrivilegedClient);
     return OK;
 }
 
@@ -1162,7 +1173,8 @@ binder::Status CameraDeviceClient::createStream(
                 isStreamInfoValid, outSurface,
                 flagtools::convertParcelableSurfaceTypeToSurface(surface), mCameraIdStr,
                 mDevice->infoPhysical(physicalCameraId), sensorPixelModesUsed, dynamicRangeProfile,
-                streamUseCase, timestampBase, mirrorMode, colorSpace, /*respectSurfaceSize*/false);
+                streamUseCase, timestampBase, mirrorMode, colorSpace, /*respectSurfaceSize*/false,
+                mPrivilegedClient);
 
         if (!res.isOk())
             return res;
@@ -1553,7 +1565,7 @@ binder::Status CameraDeviceClient::updateOutputConfiguration(int streamId,
                 flagtools::convertParcelableSurfaceTypeToSurface(newOutputsMap.valueAt(i)),
                 mCameraIdStr, mDevice->infoPhysical(physicalCameraId), sensorPixelModesUsed,
                 dynamicRangeProfile, streamUseCase, timestampBase, mirrorMode, colorSpace,
-                /*respectSurfaceSize*/ false);
+                /*respectSurfaceSize*/ false, mPrivilegedClient);
         if (!res.isOk()) return res;
 
         streamInfos.push_back(outInfo);
@@ -1950,16 +1962,40 @@ binder::Status CameraDeviceClient::finalizeOutputConfigurations(int32_t streamId
         }
 
         sp<Surface> outSurface;
-        int mirrorMode = outputConfiguration.getMirrorMode(surface);
-        res = SessionConfigurationUtils::createConfiguredSurface(
-                mStreamInfoMap[streamId], true /*isStreamInfoValid*/, outSurface,
-                flagtools::convertParcelableSurfaceTypeToSurface(surface), mCameraIdStr,
-                mDevice->infoPhysical(physicalId), sensorPixelModesUsed, dynamicRangeProfile,
-                streamUseCase, timestampBase, mirrorMode, colorSpace, /*respectSurfaceSize*/ false);
+int mirrorMode = outputConfiguration.getMirrorMode(surface);
 
-        if (!res.isOk()) return res;
+// Choose the right surface argument depending on build flags.
+#if defined(WB_LIBCAMERASERVICE_WITH_DEPENDENCIES)
+auto surfaceArg =
+        surface
+        .graphicBufferProducer;
+#elif defined(HAS_FLAGTOOLS_CONVERT_PARCELABLE_SURFACE)
+auto surfaceArg = flagtools::convertParcelableSurfaceTypeToSurface(surface);
+#else
+auto surfaceArg = surface; // Fallback: pass the parcelable surface directly
+#endif
 
-        consumerSurfaceHolders.push_back({outSurface, mirrorMode});
+res = SessionConfigurationUtils::createConfiguredSurface(
+        mStreamInfoMap[streamId],
+        /*isStreamInfoValid*/ true,
+        outSurface,
+        surfaceArg,
+        mCameraIdStr,
+        mDevice->infoPhysical(physicalId),
+        sensorPixelModesUsed,
+        dynamicRangeProfile,
+        streamUseCase,
+        timestampBase,
+        mirrorMode,
+        colorSpace,
+        /*respectSurfaceSize*/ false
+#if defined(WB_LIBCAMERASERVICE_WITH_DEPENDENCIES)
+        , mPrivilegedClient // Enable “skip stream size check for whitelisted apps”
+#endif
+);
+if (!res.isOk()) return res;
+
+consumerSurfaceHolders.push_back({outSurface, mirrorMode});
     }
     // Gracefully handle case where finalizeOutputConfigurations is called
     // without any new surface.
