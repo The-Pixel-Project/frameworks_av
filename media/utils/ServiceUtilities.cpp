@@ -169,34 +169,48 @@ static int checkRecordingInternal(const AttributionSourceState &attributionSourc
             return PERMISSION_HARD_DENIED;
         }
 
+        auto permission = source == AUDIO_SOURCE_REMOTE_SUBMIX ?
+                sModifyAudioRouting : sAndroidPermissionRecordAudio;
+
         permission::PermissionChecker permissionChecker;
         int permitted;
         if (start) {
-            // Do a double-check, where we first check without actually starting in order to handle
-            // the behavior of AppOps where ops are sometimes started but paused for SOFT_DENIED.
-            // Since there is no way to maintain reference consensus due to this behavior, avoid
-            // starting an op when a restriction is in place by first checking. In the case where we
-            // startOp would fail, call a noteOp (which will also fail) instead. This preserves
-            // behavior that is reliant on listening to op rejected events (such as the hint
-            // dialogue to unmute the microphone). Technically racy, but very unlikely.
-            //
-            // TODO(b/294609684) To be removed when the pause state for an OP is removed.
-            permitted = permissionChecker.checkPermissionForPreflightFromDatasource(
-                    sAndroidPermissionRecordAudio, resolvedAttributionSource.value(), msg,
-                    attributedOpCode);
-            if (permitted == PERMISSION_GRANTED) {
-                permitted = permissionChecker.checkPermissionForStartDataDeliveryFromDatasource(
-                        sAndroidPermissionRecordAudio, resolvedAttributionSource.value(), msg,
-                        attributedOpCode);
+            // Decide permission flow:
+// - If we're using RECORD_AUDIO, keep the preflight + start sequence to avoid
+//   starting an op that might be SOFT_DENIED.
+// - Otherwise (e.g., REMOTE_SUBMIX), check/start with the provided `permission`
+//   (or skip if none is required).
+
+if (permission == sAndroidPermissionRecordAudio) {
+    // Preflight first to handle SOFT_DENIED without starting the op.
+    // TODO(b/294609684): Remove when OP pause state is removed.
+    permitted = permissionChecker.checkPermissionForPreflightFromDatasource(
+            sAndroidPermissionRecordAudio, resolvedAttributionSource.value(), msg,
+            attributedOpCode);
+    if (permitted == PERMISSION_GRANTED) {
+        permitted = permissionChecker.checkPermissionForStartDataDeliveryFromDatasource(
+                sAndroidPermissionRecordAudio, resolvedAttributionSource.value(), msg,
+                attributedOpCode);
+    }
+} else {
+    // For sources that should not require RECORD_AUDIO (e.g., REMOTE_SUBMIX),
+    // use the alternate `permission` if provided. If none is required, treat as granted.
+    if (permission != nullptr && permission[0] != '\0') {
+        permitted = permissionChecker.checkPermissionForStartDataDeliveryFromDatasource(
+                permission, resolvedAttributionSource.value(), msg, attributedOpCode);
+    } else {
+        permitted = PERMISSION_GRANTED;
+    }
+}
             } else {
                 // intentionally don't set permitted
-                permissionChecker.checkPermissionForDataDeliveryFromDatasource(
+                permissionChecker.checkPermissionForDataDeliveryFromDatasourceurce(
                             sAndroidPermissionRecordAudio, resolvedAttributionSource.value(), msg,
                             attributedOpCode);
             }
         } else {
             permitted = permissionChecker.checkPermissionForPreflightFromDatasource(
-                    sAndroidPermissionRecordAudio, resolvedAttributionSource.value(), msg,
+                    permission, resolvedAttributionSource.value(), msg,
                     attributedOpCode);
         }
 
